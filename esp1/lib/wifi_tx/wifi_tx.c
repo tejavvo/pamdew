@@ -93,6 +93,12 @@ void wifi_tx_init(const char *ssid, const char *password)
     strncpy((char *)wifi_cfg.sta.ssid,     ssid,     sizeof(wifi_cfg.sta.ssid)     - 1);
     strncpy((char *)wifi_cfg.sta.password, password, sizeof(wifi_cfg.sta.password) - 1);
     wifi_cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    
+    /* Disable PMF (Protected Management Frames). This is a known cause 
+     * of "SA Query" timeouts and disconnects when an ESP32 connects 
+     * to another ESP32 acting as an Access Point. */
+    wifi_cfg.sta.pmf_cfg.capable = false;
+    wifi_cfg.sta.pmf_cfg.required = false;
 
     esp_wifi_set_mode(WIFI_MODE_STA);
     esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg);

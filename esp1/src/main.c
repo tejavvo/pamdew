@@ -487,7 +487,7 @@ void app_main(void)
      * *** Replace placeholder SSID and Password with yours! ***
      */
     printf("[INIT] Connecting to WiFi...\n");
-    wifi_tx_init("31415", "Area/r^2");
+    wifi_tx_init("DeliriumMonitor", "password123");
 
     /* Run per-sensor calibration before starting any tasks. */
     calibrate_all_sensors();

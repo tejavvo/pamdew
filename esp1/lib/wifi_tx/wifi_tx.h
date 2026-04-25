@@ -12,9 +12,9 @@
 #include <stdbool.h>
 
 /* ── Server endpoint ────────────────────────────────────────────────── */
-#define WIFI_TX_HOST  "192.168.211.200"   /* ← replace with server IP    */
-#define WIFI_TX_PORT  8080              /* ← replace with server port  */
-#define WIFI_TX_PATH  "/api/sensor_data"
+#define WIFI_TX_HOST  "192.168.4.1"   /* ← replace with server IP    */
+#define WIFI_TX_PORT  80              /* ← replace with server port  */
+#define WIFI_TX_PATH  "/data"
 
 /**
  * @brief Connect to WiFi in station mode and wait for an IP address.
