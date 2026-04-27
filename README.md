@@ -1,5 +1,11 @@
 # PAMDEW - ESP32 Multimodal IoT Health Sensor Hub
 
+PAMDEW is designed as a smart patient-monitoring glove for people at elevated risk of delirium, especially patients who need continuous observation for physiological instability, agitation, sudden jerks, or falls. The glove combines heart-rate/HRV, SpO2-style PPG, skin conductance, temperature, and motion sensing to estimate the patient's current stability state and provide an early warning signal when their condition appears to deteriorate.
+
+At a high level, the system works as a wearable early-warning node: the glove collects multimodal biosignals from the patient, detects stress/arousal patterns, motion artifacts, jerks, and fall-like movement, computes local quality and TinyML-style risk indicators, and streams a compact telemetry packet to a dashboard. The dashboard can then visualize heart rate, SpO2, temperature, movement, stress indicators, and an overall patient stability score for caregivers.
+
+The intended project goal is not to diagnose delirium directly, but to surface warning signs that often correlate with delirium risk or patient instability: rising stress/arousal, abnormal heart-rate variability, poor oxygenation trends, fever-like temperature changes, restless hand motion, jerks, and fall events. These signals can help caregivers prioritize attention earlier than a single vital-sign threshold would.
+
 PAMDEW is an ESP32-based IoT sensor hub for collecting multimodal physiological and motion signals. It combines ECG, PPG, SpO2-style estimation, accelerometer motion, GSR, and temperature sensing into a FreeRTOS firmware pipeline, displays live readings on an SSD1306 OLED, sends JSON telemetry over WiFi, and runs a lightweight TinyML-style feature/inference layer on-device.
 
 > Important: this is an educational/research prototype, not a medical device. The values and ML scores are not clinically validated and must not be used for diagnosis, treatment, or safety-critical decisions.
