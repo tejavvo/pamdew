@@ -1,0 +1,36 @@
+menu "Sensor Hub Configuration"
+
+    config SENSOR_HUB_WIFI_SSID
+        string "WiFi SSID"
+        default ""
+        help
+            WiFi network name used by wifi_tx_init(). Keep this out of source.
+
+    config SENSOR_HUB_WIFI_PASSWORD
+        string "WiFi password"
+        default ""
+        help
+            WiFi password used by wifi_tx_init(). Leave empty for open networks.
+
+    config SENSOR_HUB_LOG_REPORT_JSON
+        bool "Print reporter JSON to UART"
+        default n
+        help
+            Enable only during debugging. Reporter JSON may contain health-adjacent data.
+
+    config SENSOR_HUB_ML_ENABLE
+        bool "Enable TinyML feature extraction and inference"
+        default y
+        help
+            Samples the fused sensor state once per second, extracts 30-second
+            window features, and logs stress/artifact/anomaly scores locally.
+
+    config SENSOR_HUB_ML_LOG_FEATURES
+        bool "Print TinyML feature CSV rows to UART"
+        depends on SENSOR_HUB_ML_ENABLE
+        default n
+        help
+            Prints one CSV row per reporter window. Use this to collect training
+            data without changing the dashboard JSON payload.
+
+endmenu
