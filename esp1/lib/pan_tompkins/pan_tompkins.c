@@ -93,15 +93,27 @@ static void update_thresholds(void)
     s.thr2 = s.thr1 / 2;
 }
 
+static void reset_state(void)
+{
+    memset(&s, 0, sizeof(s));
+    s.spki      = INIT_SPKI;
+    s.npki      = INIT_NPKI;
+    s.last_r_us = 0;
+    update_thresholds();
+}
+
 /* ── Public API ────────────────────────────────────────────────────── */
 
 void pt_init(void)
 {
-    memset(&s, 0, sizeof(s));
-    s.spki   = INIT_SPKI;
-    s.npki   = INIT_NPKI;
-    s.last_r_us = 0;
-    update_thresholds();
+    reset_state();
+}
+
+void pt_reset(void)
+{
+    taskENTER_CRITICAL(&pt_mux);
+    reset_state();
+    taskEXIT_CRITICAL(&pt_mux);
 }
 
 bool pt_feed(int raw)

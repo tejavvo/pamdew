@@ -1,1 +1,9 @@
 .pio
+
+# Local ESP-IDF config may contain WiFi credentials.
+esp1/sdkconfig
+esp1/sdkconfig.old
+esp1/sdkconfig.local
+
+# Captured sensor/ML training logs.
+esp1/logs/

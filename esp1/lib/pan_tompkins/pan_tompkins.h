@@ -38,6 +38,14 @@ typedef struct {
 void pt_init(void);
 
 /**
+ * @brief Clear detector and RR statistics after a signal break.
+ *
+ * Thread-safe with pt_get_and_reset_stats(). Call from ecg_task when ECG
+ * leads are disconnected so stale filter state is not reused on reconnect.
+ */
+void pt_reset(void);
+
+/**
  * @brief Push one ECG sample through the Pan-Tompkins pipeline.
  * @param raw  Raw ADC count (0-4095). Subtract ECG baseline first for best results.
  * @return     true on the sample where an R-peak is declared.

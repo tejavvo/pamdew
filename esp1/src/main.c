@@ -1,5 +1,8 @@
 #include <stdio.h>
 #include <string.h>
+#include <stdbool.h>
+#include "esp_err.h"
+#include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -11,6 +14,23 @@
 #include "calibration.h"
 #include "pan_tompkins.h"
 #include "wifi_tx.h"
+#include "ml_model.h"
+
+#ifndef CONFIG_SENSOR_HUB_WIFI_SSID
+#define CONFIG_SENSOR_HUB_WIFI_SSID ""
+#endif
+
+#ifndef CONFIG_SENSOR_HUB_WIFI_PASSWORD
+#define CONFIG_SENSOR_HUB_WIFI_PASSWORD ""
+#endif
+
+#ifndef CONFIG_SENSOR_HUB_LOG_REPORT_JSON
+#define CONFIG_SENSOR_HUB_LOG_REPORT_JSON 0
+#endif
+
+#ifndef CONFIG_SENSOR_HUB_ML_ENABLE
+#define CONFIG_SENSOR_HUB_ML_ENABLE 1
+#endif
 
 /* ===== I2C bus 0 (MAX30102 + MPU6050) ===== */
 #define I2C_PORT        I2C_NUM_0
@@ -31,9 +51,17 @@
 #define AD8232_LO_POS   GPIO_NUM_32
 #define AD8232_LO_NEG   GPIO_NUM_33
 
+/* ===== PPG / SpO2 vitals (MAX30102) — 4 s @ 100 Hz window ===== */
+#define BUFFER_LEN      400
+#define FILTER_SIZE     5
+
 /* ===== Shared state ===== */
 typedef struct {
     uint32_t red, ir;       /* MAX30102 – 100 Hz */
+    float    bpm;           /* PPG-derived BPM (custom math) */
+    float    spo2;          /* PPG-derived SpO2 */
+    float    ir_ac;         /* IR AC component (signal quality) */
+    uint8_t  ppg_valid;
     int16_t  ax, ay, az;    /* MPU6050  –  50 Hz */
     int      ecg_raw;       /* AD8232   – 250 Hz */
     uint8_t  ecg_leads_ok;
@@ -52,6 +80,15 @@ static TaskHandle_t ecg_task_handle;
 
 static adc_oneshot_unit_handle_t adc1_handle;
 
+/* MAX30102 buffer + PPG state */
+static uint32_t          red_buffer[BUFFER_LEN];
+static uint32_t          ir_buffer[BUFFER_LEN];
+static int               buffer_index  = 0;
+static float             smoothed_bpm  = 0.0f;
+static uint32_t          max_i2c_errors = 0;
+static uint32_t          adc_errors     = 0;
+static bool              wifi_ready     = false;
+
 /* ===== I2C helpers ===== */
 static void sensor_i2c_init(void)
 {
@@ -65,9 +102,10 @@ static void sensor_i2c_init(void)
         .scl_pullup_en = GPIO_PULLUP_ENABLE,
     };
     c.master.clk_speed = I2C_FREQ;
-    i2c_param_config(I2C_PORT, &c);
+    ESP_ERROR_CHECK(i2c_param_config(I2C_PORT, &c));
     esp_err_t err = i2c_driver_install(I2C_PORT, I2C_MODE_MASTER, 0, 0, 0);
     printf("[INIT] I2C: driver install %s\n", err == ESP_OK ? "OK" : "FAILED");
+    ESP_ERROR_CHECK(err);
 }
 
 static esp_err_t i2c_wr(uint8_t dev, uint8_t reg, uint8_t val)
@@ -84,13 +122,24 @@ static esp_err_t i2c_rd(uint8_t dev, uint8_t reg, uint8_t *out, size_t len)
 /* ===== Sensor init ===== */
 static void max30102_init(void)
 {
-    printf("[INIT] MAX30102: setting SpO2 mode, 100 sps, 411us pulse...\n");
-    esp_err_t e1 = i2c_wr(MAX30102_ADDR, 0x09, 0x03); /* SpO2 mode                       */
-    esp_err_t e2 = i2c_wr(MAX30102_ADDR, 0x0A, 0x27); /* 100 sps, 411 µs pulse, 4096 ADC */
+    printf("[INIT] MAX30102: reset + SpO2 mode, 100 sps, 411us pulse, LED current...\n");
+    esp_err_t e0 = i2c_wr(MAX30102_ADDR, 0x09, 0x40); /* full reset (MODALITY)     */
+    vTaskDelay(pdMS_TO_TICKS(100));
+    esp_err_t e1 = i2c_wr(MAX30102_ADDR, 0x09, 0x03); /* SpO2 mode                 */
+    esp_err_t e2 = i2c_wr(MAX30102_ADDR, 0x0A, 0x27); /* 100 sps, 411 µs, 4096 ADC */
     /* INT: PPG_RDY (bit6) – fires every new sample at 100 Hz */
     esp_err_t e3 = i2c_wr(MAX30102_ADDR, 0x02, 0x40);
-    printf("[INIT] MAX30102: %s\n",
-           (e1 == ESP_OK && e2 == ESP_OK && e3 == ESP_OK) ? "OK" : "FAILED (check wiring)");
+    esp_err_t e4 = i2c_wr(MAX30102_ADDR, 0x0C, 0x24); /* LED1 (red) current        */
+    esp_err_t e5 = i2c_wr(MAX30102_ADDR, 0x0D, 0x24); /* LED2 (IR) current         */
+    bool ok = (e0 == ESP_OK && e1 == ESP_OK && e2 == ESP_OK && e3 == ESP_OK &&
+               e4 == ESP_OK && e5 == ESP_OK);
+    printf("[INIT] MAX30102: %s\n", ok ? "OK" : "FAILED (check wiring)");
+    ESP_ERROR_CHECK(e0);
+    ESP_ERROR_CHECK(e1);
+    ESP_ERROR_CHECK(e2);
+    ESP_ERROR_CHECK(e3);
+    ESP_ERROR_CHECK(e4);
+    ESP_ERROR_CHECK(e5);
 }
 
 static void mpu6050_init(void)
@@ -103,6 +152,10 @@ static void mpu6050_init(void)
     printf("[INIT] MPU6050: %s\n",
            (e1 == ESP_OK && e2 == ESP_OK && e3 == ESP_OK && e4 == ESP_OK)
            ? "OK" : "FAILED (check wiring)");
+    ESP_ERROR_CHECK(e1);
+    ESP_ERROR_CHECK(e2);
+    ESP_ERROR_CHECK(e3);
+    ESP_ERROR_CHECK(e4);
 }
 
 static void adc_sensors_init(void)
@@ -112,15 +165,15 @@ static void adc_sensors_init(void)
         .unit_id  = ADC_UNIT_1,
         .ulp_mode = ADC_ULP_MODE_DISABLE,
     };
-    adc_oneshot_new_unit(&unit_cfg, &adc1_handle);
+    ESP_ERROR_CHECK(adc_oneshot_new_unit(&unit_cfg, &adc1_handle));
 
     adc_oneshot_chan_cfg_t ch = {
         .atten    = ADC_ATTEN_DB_12,
         .bitwidth = ADC_BITWIDTH_DEFAULT,
     };
-    adc_oneshot_config_channel(adc1_handle, ECG_CHAN,  &ch);
-    adc_oneshot_config_channel(adc1_handle, GSR_CHAN,  &ch);
-    adc_oneshot_config_channel(adc1_handle, LM35_CHAN, &ch);
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, ECG_CHAN,  &ch));
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, GSR_CHAN,  &ch));
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, LM35_CHAN, &ch));
     printf("[INIT] ADC: ECG ch=%d  GSR ch=%d  LM35 ch=%d  configured\n",
            ECG_CHAN, GSR_CHAN, LM35_CHAN);
 
@@ -133,8 +186,107 @@ static void adc_sensors_init(void)
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type    = GPIO_INTR_DISABLE,
     };
-    gpio_config(&lo);
+    ESP_ERROR_CHECK(gpio_config(&lo));
     printf("[INIT] ADC: AD8232 LO pins ready\n");
+}
+
+static void invalidate_ppg_vitals(void)
+{
+    xSemaphoreTake(sensor_mutex, portMAX_DELAY);
+    g_sensor.bpm       = 0.0f;
+    g_sensor.spo2      = 0.0f;
+    g_sensor.ir_ac     = 0.0f;
+    g_sensor.ppg_valid = 0;
+    xSemaphoreGive(sensor_mutex);
+}
+
+/* Derive SpO2 / BPM from 4 s of stored MAX30102 data */
+static void process_max30102_vitals(void)
+{
+    float ir_avg  = 0.0f;
+    float red_avg = 0.0f;
+    float ir_min  = 1000000.0f;
+    float ir_max  = 0.0f;
+    float red_min = 1000000.0f;
+    float red_max = 0.0f;
+    static float filtered_ir[BUFFER_LEN];
+
+    for (int i = 0; i < BUFFER_LEN; i++) {
+        ir_avg += (float)ir_buffer[i];
+        red_avg += (float)red_buffer[i];
+        if (ir_buffer[i] < ir_min) {
+            ir_min = (float)ir_buffer[i];
+        }
+        if (ir_buffer[i] > ir_max) {
+            ir_max = (float)ir_buffer[i];
+        }
+        if (red_buffer[i] < red_min) {
+            red_min = (float)red_buffer[i];
+        }
+        if (red_buffer[i] > red_max) {
+            red_max = (float)red_buffer[i];
+        }
+
+        if (i >= FILTER_SIZE) {
+            float sum = 0.0f;
+            for (int j = 0; j < FILTER_SIZE; j++) {
+                sum += (float)ir_buffer[i - j];
+            }
+            filtered_ir[i] = sum / (float)FILTER_SIZE;
+        }
+    }
+    ir_avg /= (float)BUFFER_LEN;
+    red_avg /= (float)BUFFER_LEN;
+    float ir_ac  = ir_max - ir_min;
+    float red_ac = red_max - red_min;
+
+    int  peaks         = 0;
+    bool is_above     = false;
+    float center_line = ir_min + (ir_ac / 2.0f);
+
+    for (int i = FILTER_SIZE + 1; i < BUFFER_LEN; i++) {
+        if (filtered_ir[i] > center_line && !is_above) {
+            peaks++;
+            is_above = true;
+        } else if (filtered_ir[i] < center_line) {
+            is_above = false;
+        }
+    }
+
+    if (ir_ac < 1.0e-6f || red_ac < 1.0e-6f || ir_avg < 1.0e-6f || red_avg < 1.0e-6f) {
+        invalidate_ppg_vitals();
+        return;
+    }
+
+    float R            = (red_ac / red_avg) / (ir_ac / ir_avg);
+    if (R < 0.2f || R > 2.0f) {
+        invalidate_ppg_vitals();
+        return;
+    }
+
+    float current_spo2 = 10.0002f * (R * R) - 52.887f * R + 118.58f;
+    int   raw_bpm      = peaks * 15; /* 4 s window → scale to 1 min */
+    if (raw_bpm < 30 || raw_bpm > 220) {
+        invalidate_ppg_vitals();
+        return;
+    }
+
+    if (smoothed_bpm == 0.0f) {
+        smoothed_bpm = (float)raw_bpm;
+    }
+    smoothed_bpm     = (smoothed_bpm * 0.8f) + ((float)raw_bpm * 0.2f);
+
+    if (current_spo2 < 50.0f || current_spo2 > 100.0f) {
+        invalidate_ppg_vitals();
+        return;
+    }
+
+    xSemaphoreTake(sensor_mutex, portMAX_DELAY);
+    g_sensor.bpm   = smoothed_bpm;
+    g_sensor.spo2  = current_spo2;
+    g_sensor.ir_ac = ir_ac;
+    g_sensor.ppg_valid = 1;
+    xSemaphoreGive(sensor_mutex);
 }
 
 /* ===== GPIO interrupt setup ===== */
@@ -163,10 +315,10 @@ static void gpio_interrupts_init(void)
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type    = GPIO_INTR_NEGEDGE,
     };
-    gpio_config(&io);
-    gpio_install_isr_service(0);
-    gpio_isr_handler_add(MAX_INT_PIN, max_isr, NULL);
-    gpio_isr_handler_add(MPU_INT_PIN, mpu_isr, NULL);
+    ESP_ERROR_CHECK(gpio_config(&io));
+    ESP_ERROR_CHECK(gpio_install_isr_service(0));
+    ESP_ERROR_CHECK(gpio_isr_handler_add(MAX_INT_PIN, max_isr, NULL));
+    ESP_ERROR_CHECK(gpio_isr_handler_add(MPU_INT_PIN, mpu_isr, NULL));
     printf("[INIT] GPIO: ISR handlers registered\n");
 }
 
@@ -189,11 +341,41 @@ void max_task(void *arg)
 
         uint8_t buf[6];
         xSemaphoreTake(i2c_mutex, portMAX_DELAY);
-        i2c_rd(MAX30102_ADDR, 0x07, buf, 6);
+        esp_err_t rd_err = i2c_rd(MAX30102_ADDR, 0x07, buf, 6);
         xSemaphoreGive(i2c_mutex);
+        if (rd_err != ESP_OK) {
+            max_i2c_errors++;
+            invalidate_ppg_vitals();
+            buffer_index = 0;
+            smoothed_bpm = 0.0f;
+            if (max_i2c_errors % 100 == 1) {
+                printf("[MAX30102] I2C read failed (%s), total=%lu\n",
+                       esp_err_to_name(rd_err), (unsigned long)max_i2c_errors);
+            }
+            continue;
+        }
 
         uint32_t r  = ((buf[0]<<16)|(buf[1]<<8)|buf[2]) & 0x3FFFF;
         uint32_t ir = ((buf[3]<<16)|(buf[4]<<8)|buf[5]) & 0x3FFFF;
+
+        max30102_cal_t max_cal = max30102_cal_get();
+        uint32_t finger_thresh = (max_cal.finger_thresh > 0U) ? max_cal.finger_thresh : 5000U;
+        uint32_t r_ppg = (r > max_cal.dc_red) ? (r - max_cal.dc_red) : 0U;
+        uint32_t ir_ppg = (ir > max_cal.dc_ir) ? (ir - max_cal.dc_ir) : 0U;
+
+        if (ir > finger_thresh && r_ppg > 1000U && ir_ppg > 1000U) {
+            red_buffer[buffer_index]  = r_ppg;
+            ir_buffer[buffer_index]   = ir_ppg;
+            buffer_index++;
+            if (buffer_index >= BUFFER_LEN) {
+                process_max30102_vitals();
+                buffer_index = 0;
+            }
+        } else {
+            invalidate_ppg_vitals();
+            buffer_index = 0;
+            smoothed_bpm = 0.0f;
+        }
 
         xSemaphoreTake(sensor_mutex, portMAX_DELAY);
         g_sensor.red = r;
@@ -220,8 +402,12 @@ void mpu_task(void *arg)
 
         uint8_t buf[6];
         xSemaphoreTake(i2c_mutex, portMAX_DELAY);
-        i2c_rd(MPU6050_ADDR, 0x3B, buf, 6);
+        esp_err_t rd_err = i2c_rd(MPU6050_ADDR, 0x3B, buf, 6);
         xSemaphoreGive(i2c_mutex);
+        if (rd_err != ESP_OK) {
+            printf("[MPU6050] I2C read failed: %s\n", esp_err_to_name(rd_err));
+            continue;
+        }
 
         int16_t ax = (int16_t)((buf[0]<<8)|buf[1]);
         int16_t ay = (int16_t)((buf[2]<<8)|buf[3]);
@@ -251,26 +437,48 @@ void ecg_task(void *arg)
         .callback = ecg_timer_cb,
         .name     = "ecg",
     };
-    esp_timer_create(&ta, &ecg_timer);
-    esp_timer_start_periodic(ecg_timer, 4000); /* 4000 µs = 250 Hz */
+    esp_err_t timer_err = esp_timer_create(&ta, &ecg_timer);
+    if (timer_err != ESP_OK) {
+        printf("[TASK] ecg_task: timer create failed: %s\n", esp_err_to_name(timer_err));
+        vTaskDelete(NULL);
+        return;
+    }
+    timer_err = esp_timer_start_periodic(ecg_timer, 4000); /* 4000 µs = 250 Hz */
+    if (timer_err != ESP_OK) {
+        printf("[TASK] ecg_task: timer start failed: %s\n", esp_err_to_name(timer_err));
+        vTaskDelete(NULL);
+        return;
+    }
     printf("[TASK] ecg_task: running at 250 Hz\n");
 
     uint32_t log_ctr = 0;
+    bool prev_leads = true;
     while (1) {
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(8)); /* 8 ms = 2× period */
 
         int raw = 0;
-        adc_oneshot_read(adc1_handle, ECG_CHAN, &raw);
+        esp_err_t adc_err = adc_oneshot_read(adc1_handle, ECG_CHAN, &raw);
+        if (adc_err != ESP_OK) {
+            adc_errors++;
+            if (adc_errors % 250 == 1) {
+                printf("[ECG] ADC read failed (%s), total=%lu\n",
+                       esp_err_to_name(adc_err), (unsigned long)adc_errors);
+            }
+            continue;
+        }
         uint8_t leads = (!gpio_get_level(AD8232_LO_POS) &&
                          !gpio_get_level(AD8232_LO_NEG));
 
         /* Process ECG through Pan-Tompkins */
         ecg_cal_t ecg_cal = ecg_cal_get();
         int centered_ecg = raw - ecg_cal.baseline;
-        bool r_peak = false;
         if (leads) {
-            r_peak = pt_feed(centered_ecg);
+            (void)pt_feed(centered_ecg);
+        } else if (prev_leads) {
+            pt_reset();
+            printf("[ECG] leads off, Pan-Tompkins state reset\n");
         }
+        prev_leads = leads;
 
         xSemaphoreTake(sensor_mutex, portMAX_DELAY);
         g_sensor.ecg_raw      = raw;
@@ -295,7 +503,12 @@ void gsr_task(void *arg)
     while (1) {
         vTaskDelayUntil(&last, pdMS_TO_TICKS(100)); /* 100 ms = 10 Hz */
         int raw = 0;
-        adc_oneshot_read(adc1_handle, GSR_CHAN, &raw);
+        esp_err_t adc_err = adc_oneshot_read(adc1_handle, GSR_CHAN, &raw);
+        if (adc_err != ESP_OK) {
+            adc_errors++;
+            printf("[GSR] ADC read failed: %s\n", esp_err_to_name(adc_err));
+            continue;
+        }
         xSemaphoreTake(sensor_mutex, portMAX_DELAY);
         g_sensor.gsr_raw = raw;
         xSemaphoreGive(sensor_mutex);
@@ -314,7 +527,13 @@ void temp_task(void *arg)
     printf("[TASK] temp_task: started (1 sample/min)\n");
     while (1) {
         int raw = 0;
-        adc_oneshot_read(adc1_handle, LM35_CHAN, &raw);
+        esp_err_t adc_err = adc_oneshot_read(adc1_handle, LM35_CHAN, &raw);
+        if (adc_err != ESP_OK) {
+            adc_errors++;
+            printf("[TEMP] ADC read failed: %s\n", esp_err_to_name(adc_err));
+            vTaskDelay(pdMS_TO_TICKS(60000)); /* 1 minute */
+            continue;
+        }
 
         /*
          * Apply the LM35 calibration result.
@@ -349,25 +568,66 @@ void oled_task(void *arg)
         sensor_data_t d = g_sensor;
         xSemaphoreGive(sensor_mutex);
 
+        if (d.ppg_valid) {
+            ssd1306_printf_at(0, 1, "PPG:%3.0f SpO2:%4.1f", d.bpm, d.spo2);
+        } else {
+            ssd1306_printf_at(0, 1, "PPG:--- SpO2:---");
+        }
+
         snprintf(buf, sizeof(buf), "R:%-6lu I:%-6lu",
                  (unsigned long)d.red, (unsigned long)d.ir);
-        ssd1306_printf_at(0, 1, buf);
+        ssd1306_printf_at(0, 2, buf);
 
         snprintf(buf, sizeof(buf), "AX:%-5d AY:%-5d", d.ax, d.ay);
-        ssd1306_printf_at(0, 2, buf);
-        snprintf(buf, sizeof(buf), "AZ:%-5d", d.az);
         ssd1306_printf_at(0, 3, buf);
+        snprintf(buf, sizeof(buf), "AZ:%-5d", d.az);
+        ssd1306_printf_at(0, 4, buf);
 
         snprintf(buf, sizeof(buf), "ECG:%-4d [%s]",
                  d.ecg_raw, d.ecg_leads_ok ? "OK " : "LO!");
-        ssd1306_printf_at(0, 4, buf);
-
-        snprintf(buf, sizeof(buf), "GSR: %-5d", d.gsr_raw);
         ssd1306_printf_at(0, 5, buf);
 
-        snprintf(buf, sizeof(buf), "TEMP: %5.1f C", d.temp_c);
+        snprintf(buf, sizeof(buf), "G:%-5d T:%.1fC", d.gsr_raw, d.temp_c);
         ssd1306_printf_at(0, 6, buf);
     }
+}
+
+void ml_task(void *arg)
+{
+#if CONFIG_SENSOR_HUB_ML_ENABLE
+    printf("[TASK] ml_task: started (1 Hz feature sampler)\n");
+    TickType_t last = xTaskGetTickCount();
+    while (1) {
+        vTaskDelayUntil(&last, pdMS_TO_TICKS(1000));
+
+        xSemaphoreTake(sensor_mutex, portMAX_DELAY);
+        sensor_data_t d = g_sensor;
+        xSemaphoreGive(sensor_mutex);
+
+        mpu6050_cal_t mpu_cal = mpu6050_cal_get();
+        gsr_cal_t gsr_cal = gsr_cal_get();
+
+        ml_sample_t sample = {
+            .red          = d.red,
+            .ir           = d.ir,
+            .ppg_bpm      = d.bpm,
+            .ppg_spo2     = d.spo2,
+            .ir_ac        = d.ir_ac,
+            .ppg_valid    = d.ppg_valid != 0,
+            .ax           = d.ax - mpu_cal.accel_offset_x,
+            .ay           = d.ay - mpu_cal.accel_offset_y,
+            .az           = d.az - mpu_cal.accel_offset_z,
+            .ecg_raw      = d.ecg_raw,
+            .ecg_leads_ok = d.ecg_leads_ok != 0,
+            .gsr_raw      = d.gsr_raw - gsr_cal.baseline_raw,
+            .temp_c       = d.temp_c,
+        };
+        ml_model_sample(&sample);
+    }
+#else
+    printf("[TASK] ml_task: disabled by config\n");
+    vTaskDelete(NULL);
+#endif
 }
 
 /* ===== Calibration ===== */
@@ -437,17 +697,57 @@ void reporter_task(void *arg)
         sensor_data_t snap = g_sensor;
         xSemaphoreGive(sensor_mutex);
 
-        char json[512];
-        snprintf(json, sizeof(json),
+#if CONFIG_SENSOR_HUB_ML_ENABLE
+        ml_result_t ml_result;
+        if (ml_model_finalize_window(&pt_stats, &ml_result)) {
+            ml_model_log_result(&ml_result);
+        } else {
+            printf("[ML] No feature samples collected for this window\n");
+        }
+#endif
+
+        char ppg_json[96];
+        int ppg_len;
+        if (snap.ppg_valid) {
+            ppg_len = snprintf(ppg_json, sizeof(ppg_json),
+                               "\"ppg_valid\":1,\"ppg_bpm\":%.1f,\"ppg_spo2\":%.1f,\"ir_ac\":%.1f,",
+                               snap.bpm, snap.spo2, snap.ir_ac);
+        } else {
+            ppg_len = snprintf(ppg_json, sizeof(ppg_json),
+                               "\"ppg_valid\":0,\"ppg_bpm\":null,\"ppg_spo2\":null,\"ir_ac\":0.0,");
+        }
+        if (ppg_len < 0 || ppg_len >= (int)sizeof(ppg_json)) {
+            printf("[REPORTER] PPG JSON overflow, skipping POST\n");
+            continue;
+        }
+
+        char json[640];
+        int json_len = snprintf(json, sizeof(json),
             "{\"bpm\":%.1f,\"mean_rr_ms\":%.1f,\"sdnn_ms\":%.1f,\"rmssd_ms\":%.1f,\"r_peaks\":%lu,"
+            "%s"
             "\"spo2_red\":%lu,\"spo2_ir\":%lu,"
             "\"accel\":[%d,%d,%d],\"ecg_leads\":%d,\"gsr\":%d,\"temp\":%.1f}",
             pt_stats.bpm, pt_stats.mean_rr_ms, pt_stats.sdnn_ms, pt_stats.rmssd_ms, (unsigned long)pt_stats.r_peaks,
+            ppg_json,
             (unsigned long)snap.red, (unsigned long)snap.ir,
             snap.ax, snap.ay, snap.az,
             snap.ecg_leads_ok, snap.gsr_raw, snap.temp_c);
-            
+        if (json_len < 0 || json_len >= (int)sizeof(json)) {
+            printf("[REPORTER] JSON overflow (%d/%u), skipping POST\n",
+                   json_len, (unsigned int)sizeof(json));
+            continue;
+        }
+
+#if CONFIG_SENSOR_HUB_LOG_REPORT_JSON
         printf("[REPORTER] Sending JSON:\n%s\n", json);
+#else
+        printf("[REPORTER] Sending JSON (%d bytes)\n", json_len);
+#endif
+
+        if (!wifi_ready) {
+            printf("[REPORTER] WiFi not configured/ready, skipping POST\n");
+            continue;
+        }
         
         bool ok = wifi_tx_post_json(json);
         if (ok) {
@@ -455,6 +755,21 @@ void reporter_task(void *arg)
         } else {
             printf("[REPORTER] POST failed\n");
         }
+    }
+}
+
+static void create_task_checked(TaskFunction_t task_func,
+                                const char *name,
+                                uint32_t stack_depth,
+                                void *params,
+                                UBaseType_t priority,
+                                TaskHandle_t *task_handle)
+{
+    BaseType_t ok = xTaskCreate(task_func, name, stack_depth, params, priority, task_handle);
+    if (ok != pdPASS) {
+        printf("[INIT] Failed to create %s (stack=%lu prio=%lu)\n",
+               name, (unsigned long)stack_depth, (unsigned long)priority);
+        ESP_ERROR_CHECK(ESP_ERR_NO_MEM);
     }
 }
 
@@ -472,6 +787,10 @@ void app_main(void)
     printf("[INIT] Creating mutexes...\n");
     i2c_mutex    = xSemaphoreCreateMutex();
     sensor_mutex = xSemaphoreCreateMutex();
+    if (i2c_mutex == NULL || sensor_mutex == NULL) {
+        printf("[INIT] Mutex creation failed\n");
+        ESP_ERROR_CHECK(ESP_ERR_NO_MEM);
+    }
     printf("[INIT] Mutexes created\n");
 
     printf("[INIT] Initialising sensors...\n");
@@ -481,32 +800,46 @@ void app_main(void)
     printf("[INIT] Initialising Pan-Tompkins...\n");
     pt_init();
 
+#if CONFIG_SENSOR_HUB_ML_ENABLE
+    printf("[INIT] Initialising TinyML feature model...\n");
+    ml_model_init();
+#endif
+
     /* 
      * Connect to WiFi before starting calibration so network traffic doesn't
      * interfere with the precise timing loops.
-     * *** Replace placeholder SSID and Password with yours! ***
+     * Configure SSID/password with idf.py menuconfig -> Sensor Hub Configuration.
      */
     printf("[INIT] Connecting to WiFi...\n");
-    wifi_tx_init("DeliriumMonitor", "password123");
+    if (CONFIG_SENSOR_HUB_WIFI_SSID[0] == '\0') {
+        printf("[INIT] WiFi SSID is empty; configure Sensor Hub WiFi settings. POST disabled.\n");
+    } else {
+        wifi_tx_init(CONFIG_SENSOR_HUB_WIFI_SSID, CONFIG_SENSOR_HUB_WIFI_PASSWORD);
+        wifi_ready = true;
+    }
 
     /* Run per-sensor calibration before starting any tasks. */
     calibrate_all_sensors();
 
     printf("[INIT] Creating sensor tasks...\n");
-    xTaskCreate(ecg_task,  "ecg",  4096, NULL, 5, &ecg_task_handle);
+    create_task_checked(ecg_task,  "ecg",  4096, NULL, 5, &ecg_task_handle);
     printf("[INIT]   ecg_task  created (prio 5, 4096 B stack)\n");
-    xTaskCreate(max_task,  "max",  4096, NULL, 4, &max_task_handle);
+    create_task_checked(max_task,  "max",  4096, NULL, 4, &max_task_handle);
     printf("[INIT]   max_task  created (prio 4, 4096 B stack)\n");
-    xTaskCreate(mpu_task,  "mpu",  4096, NULL, 4, &mpu_task_handle);
+    create_task_checked(mpu_task,  "mpu",  4096, NULL, 4, &mpu_task_handle);
     printf("[INIT]   mpu_task  created (prio 4, 4096 B stack)\n");
-    xTaskCreate(reporter_task, "reporter", 4096, NULL, 3, NULL);
+    create_task_checked(reporter_task, "reporter", 4096, NULL, 3, NULL);
     printf("[INIT]   reporter_task created (prio 3, 4096 B stack)\n");
-    xTaskCreate(gsr_task,  "gsr",  2048, NULL, 2, NULL);
+    create_task_checked(gsr_task,  "gsr",  2048, NULL, 2, NULL);
     printf("[INIT]   gsr_task  created (prio 2, 2048 B stack)\n");
-    xTaskCreate(temp_task, "tmp",  2048, NULL, 1, NULL);
+    create_task_checked(temp_task, "tmp",  2048, NULL, 1, NULL);
     printf("[INIT]   temp_task created (prio 1, 2048 B stack)\n");
-    xTaskCreate(oled_task, "oled", 4096, NULL, 1, NULL);
+    create_task_checked(oled_task, "oled", 4096, NULL, 1, NULL);
     printf("[INIT]   oled_task created (prio 1, 4096 B stack)\n");
+#if CONFIG_SENSOR_HUB_ML_ENABLE
+    create_task_checked(ml_task, "ml", 3072, NULL, 1, NULL);
+    printf("[INIT]   ml_task created (prio 1, 3072 B stack)\n");
+#endif
 
     printf("[INIT] Enabling GPIO interrupts...\n");
     gpio_interrupts_init();
